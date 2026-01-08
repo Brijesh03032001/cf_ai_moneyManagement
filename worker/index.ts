@@ -1,0 +1,395 @@
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { FinanceMemory } from './durable-objects/FinanceMemory';
+import type { Expense } from './types/expense';
+import { processExpenseInput } from "./ai/parse-expense";
+import { INTENTS } from "./ai/prompts/intent-classification";
+import { classifyIntent } from "./ai/classify-intent";
+import { queryExpenses } from "./ai/query-expenses";
+import { identifyExpenseToDelete } from "./ai/delete-expense";
+
+export { FinanceMemory };
+
+interface Env {
+  AI: Ai;
+  FINANCE_MEMORY: DurableObjectNamespace<FinanceMemory>;
+}
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.use('/*', cors());
+
+app.get('/', (c) => {
+  return c.json({
+    name: 'Finance Tracker API',
+    version: '2.0.0',
+    status: 'running',
+    features: ['Natural Language Processing', 'AI Categorization']
+  });
+});
+
+app.post('/api/expense-natural', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { userId, input } = body;
+
+    if (!userId) {
+      return c.json({ success: false, error: 'userId required' }, 400);
+    }
+
+    if (!input || typeof input !== 'string' || input.trim().length === 0) {
+      return c.json({ success: false, error: 'input required' }, 400);
+    }
+
+    const aiResult = await processExpenseInput(c.env.AI, input);
+
+    if (!aiResult.success) {
+      return c.json({
+        success: false,
+        error: 'Could not understand expense'
+      }, 400);
+    }
+
+    const expense: Expense = {
+      id: crypto.randomUUID(),
+      amount: aiResult.amount,
+      category: aiResult.category,
+      merchant: aiResult.merchant,
+      description: input,
+      date: new Date().toISOString().split('T')[0],
+      createdAt: Date.now()
+    };
+
+    try {
+      const id = c.env.FINANCE_MEMORY.idFromName(userId);
+      const stub = c.env.FINANCE_MEMORY.get(id);
+
+      // Retry logic for Durable Object connection issues in dev mode
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          await stub.addExpense(expense);
+          break;
+        } catch (err: any) {
+          retries--;
+          if (retries === 0 || !err.retryable) {
+            throw err;
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+
+      return c.json({
+        success: true,
+        message: aiResult.message,
+        expense: {
+          id: expense.id,
+          amount: expense.amount,
+          category: expense.category,
+          merchant: expense.merchant,
+          date: expense.date
+        }
+      });
+
+    } catch (dbError) {
+      console.error('❌ Database error:', dbError);
+
+      return c.json({
+        success: false,
+        message: "Sorry, couldn't save your expense.",
+        error: 'Database error'
+      }, 500);
+    }
+
+  } catch (error) {
+    console.error('❌ API Error:', error);
+
+    return c.json({
+      success: false,
+      message: "Something went wrong. Please try again.",
+      error: error instanceof Error ? error.message : 'Unknown error'
+    }, 500);
+  }
+});
+
+app.post('/api/expenses', async (c) => {
+  try {
+    const body = await c.req.json();
+
+    if (!body.userId || !body.amount || !body.description) {
+      return c.json({ error: 'Missing fields' }, 400);
+    }
+
+    const expense: Expense = {
+      id: crypto.randomUUID(),
+      amount: Number(body.amount),
+      category: body.category || 'Other',
+      description: body.description,
+      merchant: body.merchant,
+      date: new Date().toISOString().split('T')[0],
+      createdAt: Date.now()
+    };
+
+    const id = c.env.FINANCE_MEMORY.idFromName(body.userId);
+    const stub = c.env.FINANCE_MEMORY.get(id);
+
+    // Retry logic for Durable Object connection issues
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        await stub.addExpense(expense);
+        break;
+      } catch (err: any) {
+        retries--;
+        if (retries === 0 || !err.retryable) {
+          throw err;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    return c.json({ success: true, expense });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+app.get('/api/expenses/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId');
+    const id = c.env.FINANCE_MEMORY.idFromName(userId);
+    const stub = c.env.FINANCE_MEMORY.get(id);
+    const expenses = await stub.getExpenses();
+
+    return c.json({ success: true, expenses, count: expenses.length });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+app.delete('/api/expenses/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId');
+    const id = c.env.FINANCE_MEMORY.idFromName(userId);
+    const stub = c.env.FINANCE_MEMORY.get(id);
+    await stub.clearExpenses();
+    return c.json({ success: true });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+// Chat history endpoints
+app.get('/api/chat/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId');
+    const id = c.env.FINANCE_MEMORY.idFromName(userId);
+    const stub = c.env.FINANCE_MEMORY.get(id);
+    const messages = await stub.getChatMessages();
+
+    return c.json({ success: true, messages, count: messages.length });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+app.post('/api/chat/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId');
+    const body = await c.req.json();
+
+    if (!body.role || !body.content) {
+      return c.json({ error: 'Missing role or content' }, 400);
+    }
+
+    const message = {
+      id: body.id || crypto.randomUUID(),
+      role: body.role,
+      content: body.content,
+      timestamp: body.timestamp || Date.now(),
+      expense: body.expense
+    };
+
+    const id = c.env.FINANCE_MEMORY.idFromName(userId);
+    const stub = c.env.FINANCE_MEMORY.get(id);
+
+    // Retry logic for Durable Object connection issues
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        await stub.addChatMessage(message);
+        break;
+      } catch (err: any) {
+        retries--;
+        if (retries === 0 || !err.retryable) {
+          throw err;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    return c.json({ success: true, message });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+app.delete('/api/chat/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId');
+    const id = c.env.FINANCE_MEMORY.idFromName(userId);
+    const stub = c.env.FINANCE_MEMORY.get(id);
+    await stub.clearChatMessages();
+    return c.json({ success: true });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+app.post('/api/voice-command', async (c) => {
+  try {
+    const { userId, input } = await c.req.json();
+
+    if (!userId || !input) {
+      return c.json({ success: false, error: 'Missing userId or input' }, 400);
+    }
+
+    const intent = await classifyIntent(c.env.AI, input);
+
+
+    if (intent === INTENTS.ADD_EXPENSE) {
+      const aiResult = await processExpenseInput(c.env.AI, input);
+
+      if (!aiResult.success) {
+        return c.json({
+          success: false,
+          message: "Sorry, I couldn't understand that expense. Try: 'I spent $50 on coffee'"
+        }, 400);
+      }
+
+      const expense: Expense = {
+        id: crypto.randomUUID(),
+        amount: aiResult.amount,
+        category: aiResult.category,
+        merchant: aiResult.merchant,
+        description: input,
+        date: new Date().toISOString().split('T')[0],
+        createdAt: Date.now()
+      };
+
+      try {
+        const id = c.env.FINANCE_MEMORY.idFromName(userId);
+        const stub = c.env.FINANCE_MEMORY.get(id);
+
+        // Retry logic for Durable Object connection issues in dev mode
+        let retries = 3;
+        while (retries > 0) {
+          try {
+            await stub.addExpense(expense);
+            break;
+          } catch (err: any) {
+            retries--;
+            if (retries === 0 || !err.retryable) {
+              throw err;
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
+
+        return c.json({
+          success: true,
+          message: aiResult.message,
+          data: { expense }
+        });
+
+      } catch (dbError) {
+        return c.json({
+          success: false,
+          message: "Sorry, couldn't save your expense."
+        }, 500);
+      }
+    }
+
+    else if (intent === INTENTS.QUERY) {
+      const id = c.env.FINANCE_MEMORY.idFromName(userId);
+      const stub = c.env.FINANCE_MEMORY.get(id);
+      const expenses = await stub.getExpenses();
+
+      const answer = await queryExpenses(c.env.AI, input, expenses);
+
+      return c.json({
+        success: true,
+        message: answer,
+        data: { count: expenses.length }
+      });
+    }
+
+    else if (intent === INTENTS.HELP) {
+      return c.json({
+        success: true,
+        message: "I can help you track expenses! Try saying 'I spent $50 on coffee' or 'How much did I spend on food?'"
+      });
+    }
+
+    else if (intent === INTENTS.DELETE_EXPENSE) {
+      const id = c.env.FINANCE_MEMORY.idFromName(userId);
+      const stub = c.env.FINANCE_MEMORY.get(id);
+      const expenses = await stub.getExpenses();
+
+      const deleteResult = await identifyExpenseToDelete(c.env.AI, input, expenses);
+
+      if (!deleteResult.success || (!deleteResult.expenseId && !deleteResult.expenseIds)) {
+        return c.json({
+          success: false,
+          message: deleteResult.message
+        });
+      }
+
+      // Bulk delete: delete all matching expenses
+      if (deleteResult.isBulkDelete && deleteResult.expenseIds) {
+        let deletedCount = 0;
+        for (const expenseId of deleteResult.expenseIds) {
+          const deleted = await stub.deleteExpense(expenseId);
+          if (deleted) deletedCount++;
+        }
+
+        return c.json({
+          success: true,
+          message: deletedCount > 0
+            ? deleteResult.message
+            : "Couldn't delete those expenses. They might already be gone."
+        });
+      }
+
+      // Single delete
+      const deleted = await stub.deleteExpense(deleteResult.expenseId!);
+
+      if (deleted) {
+        return c.json({
+          success: true,
+          message: deleteResult.message
+        });
+      } else {
+        return c.json({
+          success: false,
+          message: "Couldn't delete that expense. It might already be gone."
+        });
+      }
+    }
+
+    else {
+      return c.json({
+        success: true,
+        message: "I'm not sure what you mean. Try: 'I spent $X on something' or 'How much did I spend?'"
+      });
+    }
+
+  } catch (error) {
+    return c.json({
+      success: false,
+      message: "Oops! Something went wrong."
+    }, 500);
+  }
+});
+
+export default app;
